@@ -1,15 +1,23 @@
+# 构建配置。判题器并不需要安装本包（run.sh 直接跑 main3.py），
+# 保留它是为了 `pip install -e .` 之类的本地调试，以及声明最低 Python 版本。
+
 [build-system]
+# setuptools>=68 才完整支持下面的 pyproject 写法。
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vanilla-v2"
 version = "0.1.0"
+# 代码里用到了 `X | None`、`slots=True` 等语法，需要 3.10+，这里保守要求 3.11。
 requires-python = ">=3.11"
+# 刻意零第三方依赖：只用标准库，避免判题沙盒里装不上包。
 dependencies = []
 
 [tool.setuptools]
+# 源码放在 src/ 下（src 布局），而不是工程根目录。
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
+# 自动发现 src/agent 这个包。
 where = ["src"]
