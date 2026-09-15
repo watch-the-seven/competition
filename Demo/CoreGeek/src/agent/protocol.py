@@ -63,6 +63,48 @@ ROCKET_SPLASH_DAMAGE = 10
 # 八方向偏移量（上下左右 + 四个斜角）
 STEPS_8 = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 
+# 所有已知的单位类型，用于排查「报文里出现了没见过的 roleType」。
+KNOWN_KINDS = frozenset(
+    (STATION, WALL, WORKER, PIONEER, GATLING, RAILGUN, ROCKET)
+)
+
+
+def as_int(value: Any, default: int = 0) -> int:
+    """尽量把报文里的值转成整数；转不了就用默认值，绝不抛异常。
+
+    报文是外部输入，字段偶尔缺类型（null、字符串、甚至整个字段没有），
+    解析层必须扛住——抛异常会导致整个回合拿不到指令。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# 报文里的枚举值到「规范写法」的映射（键统一小写）。
+# 注意不能简单粗暴地转小写：像 weaponShop 这种驼峰值转小写后就再也匹配不上了，
+# 必须映回文档里的规范拼写。
+_CANONICAL = {
+    name.lower(): name
+    for name in (
+        STONE, IRON, COPPER, VENDOR, WEAPON_SHOP,
+        "challengerTaskPoint1", "challengerTaskPoint2",
+        "defenderTaskPoint1", "defenderTaskPoint2",
+        STATION, WALL, WORKER, PIONEER, GATLING, RAILGUN, ROCKET,
+        TEAM_CHALLENGER, TEAM_DEFENDER,
+    )
+}
+
+
+def as_kind(value: Any) -> str:
+    """规范化 roleType / neutralType 这类枚举字符串。
+
+    去掉首尾空白、容忍大小写差异，但仍映回文档里的规范拼写；
+    没见过的取值原样返回，方便日志里看出「报文给了什么奇怪的值」。
+    """
+    raw = str(value or "").strip()
+    return _CANONICAL.get(raw.lower(), raw)
+
 
 # ------------------------------------------------------------------- 基础结构
 @dataclass(frozen=True, slots=True, order=True)
@@ -75,7 +117,7 @@ class Pos:
     @classmethod
     def load(cls, raw: Any) -> "Pos":
         """从报文的 {"x":..,"y":..} 构造。"""
-        return cls(int(raw["x"]), int(raw["y"]))
+        return cls(as_int(raw.get("x")), as_int(raw.get("y")))
 
     def dump(self) -> dict[str, int]:
         """转回报文格式。"""
@@ -99,17 +141,39 @@ def distance(first: Pos, second: Pos) -> int:
     return max(abs(first.x - second.x), abs(first.y - second.y))
 
 
-def station_footprint(pos: Pos) -> tuple[Pos, ...]:
-    """接口文档 1.3.1：基地 2*2，报文里的 pos 是左上角坐标。
+# 报文里 station 的 pos 是基地 2x2 的「左上角」（接口文档 1.3.1），
+# 而需求描述布局时说的 (x,y) 是基地「左下角」，两者相差一格。
+# 全工程只在这里做换算：口径若变，改这一个常量即可，
+# 基地占格与布局锚点会一起跟着变，不会出现一处改一处没改的错位。
+POS_IS_TOP_LEFT = True
 
-    返回基地占据的 4 个格子，用于判断障碍与建造区距离。
+
+def station_footprint(pos: Pos) -> tuple[Pos, ...]:
+    """基地 2x2 占据的 4 格（按 POS_IS_TOP_LEFT 解释 pos）。
+
+    用于判断障碍、以及算「某格离基地几圈」。
     """
+    if POS_IS_TOP_LEFT:
+        return (
+            pos,
+            Pos(pos.x + 1, pos.y),
+            Pos(pos.x, pos.y - 1),
+            Pos(pos.x + 1, pos.y - 1),
+        )
     return (
         pos,
         Pos(pos.x + 1, pos.y),
-        Pos(pos.x, pos.y - 1),
-        Pos(pos.x + 1, pos.y - 1),
+        Pos(pos.x, pos.y + 1),
+        Pos(pos.x + 1, pos.y + 1),
     )
+
+
+def base_lower_left(pos: Pos) -> Pos:
+    """把报文的 station pos 换算成需求口径的基地左下角 (x, y)。
+
+    布局公式（火箭 / 站位 / 城墙）全部以这个左下角为原点。
+    """
+    return Pos(pos.x, pos.y - 1) if POS_IS_TOP_LEFT else Pos(pos.x, pos.y)
 
 
 # ------------------------------------------------------------------- Request
@@ -131,15 +195,18 @@ class Unit:
     def load(cls, raw: dict[str, Any]) -> "Unit":
         # 报文里建筑没有 backPackCapability，用 None 表示「不适用」。
         raw_capacity = raw.get("backPackCapability")
+        # health 缺失时按「存活」处理：把缺失当成 0 会把整个队伍判成阵亡，
+        # 结果所有角色都不再被调度。只有显式给 0 才视为阵亡。
+        raw_health = raw.get("health")
         return cls(
-            int(raw.get("id") or 0),
+            as_int(raw.get("id")),
             Pos.load(raw["pos"]),
-            str(raw["roleType"]),
-            int(raw.get("health") or 0),
-            int(raw.get("level") or 0),
-            int(raw.get("cooldown") or 0),
-            int(raw.get("attackRange") or 0),
-            int(raw_capacity) if raw_capacity is not None else None,
+            as_kind(raw.get("roleType")),
+            as_int(raw_health, 1) if raw_health is not None else 1,
+            as_int(raw.get("level")),
+            as_int(raw.get("cooldown")),
+            as_int(raw.get("attackRange")),
+            as_int(raw_capacity) if raw_capacity is not None else None,
             tuple(str(item) for item in raw.get("backpack") or ()),
         )
 
@@ -179,11 +246,11 @@ class Robot:
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "Robot":
         return cls(
-            int(raw.get("id") or 0),
+            as_int(raw.get("id")),
             Pos.load(raw["pos"]),
-            str(raw.get("roleType") or ""),
-            int(raw.get("health") or 0),
-            str(raw.get("targetTeam") or ""),
+            as_kind(raw.get("roleType")),
+            as_int(raw.get("health")),
+            as_kind(raw.get("targetTeam")),
             str(raw.get("abnormalState") or ""),
         )
 
@@ -203,13 +270,13 @@ class PlayerTask:
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "PlayerTask":
         return cls(
-            str(raw.get("taskType") or ""),
+            as_kind(raw.get("taskType")),
             Pos.load(raw["taskPosition"]),
-            int(raw.get("coldDownRounds") or 0),
-            int(raw.get("scoreReward") or 0),
-            int(raw.get("goldReward") or 0),
+            as_int(raw.get("coldDownRounds")),
+            as_int(raw.get("scoreReward")),
+            as_int(raw.get("goldReward")),
             bool(raw.get("isValid")),
-            int(raw.get("timeoutRounds") or 0),
+            as_int(raw.get("timeoutRounds")),
         )
 
 
@@ -246,7 +313,7 @@ class Turn:
         对所有可选字段都做了兜底（`or {}` / `or 0`），
         这样即使某个字段缺失也只是少一点信息，不会让整场异常退出。
         """
-        round_no = int(payload["roundNo"])
+        round_no = as_int(payload.get("roundNo"), 1)
         info = payload.get("mapInfo") or {}
         team = payload.get("teamOur") or {}
         robot_block = payload.get("robot") or {}
@@ -271,13 +338,13 @@ class Turn:
             round_no=round_no,
             # 任务书 4.2：白天 = 每天的前 70 回合。
             is_day=(round_no - 1) % ROUNDS_PER_DAY < DAY_ROUNDS,
-            gold=int(team.get("goldNum") or 0),
-            total_score=int(team.get("totalScore") or 0),
-            width=int(info.get("width") or 41),
-            height=int(info.get("height") or 32),
-            our_type=str(team.get("type") or ""),
+            gold=as_int(team.get("goldNum")),
+            total_score=as_int(team.get("totalScore")),
+            width=as_int(info.get("width"), 41),
+            height=as_int(info.get("height"), 32),
+            our_type=as_kind(team.get("type")),
             zones={
-                Pos.load(zone["pos"]): str(zone.get("neutralType") or "")
+                Pos.load(zone["pos"]): as_kind(zone.get("neutralType"))
                 for zone in info.get("zones") or ()
             },
             ours=tuple(Unit.load(role) for role in team.get("roles") or ()),
@@ -294,11 +361,11 @@ class Turn:
             llm_resp=str(payload.get("llmResp") or ""),
             last_cmd_result=str(payload.get("lastCmdResult") or ""),
             action_results=actions,
-            summon_result=int(payload.get("lastSummonTreasureResult") or 0),
+            summon_result=as_int(payload.get("lastSummonTreasureResult")),
             vendor_prices=prices,
             weapon_prices=shop,
             errors=tuple(
-                (int(err.get("errorCode") or 0), str(err.get("description") or ""))
+                (as_int(err.get("errorCode")), str(err.get("description") or ""))
                 for err in payload.get("errors") or ()
             ),
         )

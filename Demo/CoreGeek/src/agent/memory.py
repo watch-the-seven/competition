@@ -5,16 +5,42 @@ HTTP 服务在整个比赛期间常驻（判题器只在一局开始时拉起一
 lastRoundRoleActionResults，并保存任务状态机、BOSS 采购状态、采矿目标等。
 
 本文件分两部分：
-  1. Plan 及其私有构造函数——开局算一次、整局不变的静态布局；
+  1. Plan——开局算一次、整局不变的静态布局（武器位 / 站位 / 城墙位）；
   2. Memory——每回合读写一次的动态状态。
 
-建造区规则（本项目采用的口径）：
-  基地是 2x2；与基地外形切比雪夫距离 = 1 的那一圈是「武器可建造区」，
-  距离 = 2 的那一圈是「城墙可建造区」。
+布局规则（需求给定，全是固定坐标，不再做启发式选址）
+------------------------------------------------------
+记基地「左下角」为 (x, y)，则基地占 4 格：
+
+    (x,y) (x+1,y) (x,y+1) (x+1,y+1)
+
+3 座火箭发射台：      (x+2,y+2)   (x+2,y-1)   (x-1,y)
+3 个站位（按 unit_id 末两位绑定，站位必须紧贴自己要操控的炮台）：
+
+    末两位 10 的工人   -> 站 (x+1,y+2)，操控 (x+2,y+2)
+    末两位 11 的开拓者 -> 站 (x-2,y)  ，操控 (x-1,y)
+    末两位 12 的工人   -> 站 (x+1,y-1)，操控 (x+2,y-1)
+
+10 面城墙（C 形：下沿 3 格 + 右列 6 格 + 上沿 3 格，两个角格共用）：
+
+    (x+1,y-2) (x+2,y-2) (x+3,y-2)
+    (x+3,y-1) (x+3,y) (x+3,y+1) (x+3,y+2) (x+3,y+3)
+    (x+2,y+3) (x+1,y+3)
+
+基地 x > 10 时，整套坐标关于点 (20, 15.5) 中心对称，也就是右下角那一方的镜像布局。
+
+坐标口径提醒（很容易差一格）
+---------------------------
+需求里的 (x,y) 是基地「左下角」，而报文里 station 的 pos 是「左上角」
+（接口文档 1.3.1），所以 x = pos.x、y = pos.y - 1。
+样例报文里 station=(10,24)，已有的三座塔位于 (9,24)/(10,25)/(9,25)——
+只有按「pos 是左上角」理解，这三格才都落在基地外一圈；若把 pos 当左下角，
+(10,25) 会落进基地里，说明口径必须是左上角。
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
 
@@ -23,235 +49,134 @@ from .protocol import (
     ROCKET,
     STONE,
     TEAM_DEFENDER,
-    WALL_MATERIAL,
     Pos,
     Turn,
     Unit,
+    base_lower_left,
     distance,
     neighbours,
     station_footprint,
 )
 
+LOGGER = logging.getLogger(__name__)
+
 WALL_COUNT = 10                 # 需求：10 块石头砌 10 面墙
-TOWER_COUNT = 3                 # 任务书 4.5.1：武器工事全局最多 3 座
+TOWER_COUNT = 3                 # 需求：3 座火箭发射台（任务书 4.5.1 上限也是 3）
+
+# --------------------------------------------------------------- 固定布局表
+# 偏移量一律以「基地左下角」为原点，和需求里的写法逐条对应，方便核对。
+# unit_id 末两位 -> (站位偏移, 该站位负责操控的炮台偏移)
+# 三座炮台分别是 (x+2,y+2) / (x+2,y-1) / (x-1,y)，与需求逐条对应。
+SLOT_LAYOUT: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {
+    "10": ((+1, +2), (+2, +2)),     # 工人1
+    "11": ((-2, 0), (-1, 0)),       # 开拓者
+    "12": ((+1, -1), (+2, -1)),     # 工人2
+}
+SLOT_ORDER: tuple[str, ...] = ("10", "11", "12")
+WALL_OFFSETS: tuple[tuple[int, int], ...] = (
+    (+1, -2), (+2, -2), (+3, -2),
+    (+3, -1), (+3, 0), (+3, +1), (+3, +2), (+3, +3),
+    (+2, +3), (+1, +3),
+)
+# 需求：基地 x>10 时关于该点中心对称（41x32 地图的中心）
+MIRROR_PIVOT_X = 20.0
+MIRROR_PIVOT_Y = 15.5
+MIRROR_THRESHOLD_X = 10
 
 
 # --------------------------------------------------------------------- 几何规划
 @dataclass(frozen=True, slots=True)
 class Plan:
-    """第一天开局就确定下来的静态布局（基地位置整局不变）。"""
+    """开局算一次、整局不变的静态布局。"""
 
-    corner: str                                  # "tl"=基地在左上角, "br"=右下角
+    corner: str                                  # "tl"=原布局, "br"=镜像布局
+    mirrored: bool                               # 是否用了镜像坐标
     footprint: tuple[Pos, ...]                   # 基地占据的 4 格
-    ring_weapon: tuple[Pos, ...]                 # 基地外一圈：武器可建造区
-    ring_wall: tuple[Pos, ...]                   # 再外一圈：城墙可建造区
-    tower_sites: tuple[Pos, ...]                 # 3 座火箭发射台选址
-    wall_sites: tuple[Pos, ...]                  # 10 面城墙选址（C 形护罩）
-    stands: tuple[Pos, ...]                      # 与 tower_sites 一一对应的站位格
+    tower_sites: tuple[Pos, ...]                 # 3 座火箭发射台（按 SLOT_ORDER 排列）
+    stands: tuple[Pos, ...]                      # 与 tower_sites 一一对应的站位
+    wall_sites: tuple[Pos, ...]                  # 10 面城墙
+    slot_index: dict[str, int]                   # 末两位 -> 上面两个数组的下标
 
     @classmethod
     def build(cls, turn: Turn) -> "Plan | None":
-        """按当前回合的地图算一遍布局；没有基地时返回 None。"""
+        """按当前回合的基地位置算出整套固定布局。"""
         station = turn.station()
         if station is None:
+            LOGGER.warning("报文里没有基地(station)，无法规划布局")
             return None
         footprint = station_footprint(station.pos)
-        corner = _corner_of(turn, station)
-        ring_weapon = _ring(turn, footprint, 1)
-        ring_wall = _ring(turn, footprint, 2)
-        wall_sites = _wall_sites(turn, footprint, ring_wall, corner)
-        tower_sites, stands = _tower_sites(turn, footprint, ring_weapon, wall_sites)
+        # 需求里的 (x,y) 是左下角，报文 pos 是左上角；换算集中在 protocol 一处。
+        origin = base_lower_left(station.pos)
+        mirrored = _is_mirrored(turn, station)
+
+        def place(offset: tuple[int, int]) -> Pos:
+            """把「相对基地左下角」的偏移换成真实坐标。
+
+            镜像时偏移取 (1-dx, 1-dy)：镜像会把基地的左下角映射到对面基地的
+            右上角，所以相对新基地左下角的偏移正好是 (1-dx, 1-dy)。
+            """
+            dx, dy = offset
+            if mirrored:
+                dx, dy = 1 - dx, 1 - dy
+            return Pos(origin.x + dx, origin.y + dy)
+
+        tower_sites: list[Pos] = []
+        stands: list[Pos] = []
+        slot_index: dict[str, int] = {}
+        for slot in SLOT_ORDER:
+            stand_off, rocket_off = SLOT_LAYOUT[slot]
+            slot_index[slot] = len(tower_sites)
+            tower_sites.append(place(rocket_off))
+            stands.append(place(stand_off))
+
+        walls = [place(off) for off in WALL_OFFSETS]
+        # 布局是写死的：落点并非合法空地时只剔除并告警，不悄悄换到别处。
+        bad_walls = [pos for pos in walls if not turn.land(pos)]
+        if bad_walls:
+            LOGGER.warning("有 %d 个城墙位不是合法空地，已剔除：%s",
+                           len(bad_walls), [str(pos) for pos in bad_walls])
+            walls = [pos for pos in walls if turn.land(pos)]
+        bad_fixed = [
+            str(pos) for pos in (*tower_sites, *stands) if not turn.land(pos)
+        ]
+        if bad_fixed:
+            LOGGER.warning("固定布局里有 %d 格不是合法空地：%s",
+                           len(bad_fixed), bad_fixed)
+        if len(tower_sites) != TOWER_COUNT or len(walls) != WALL_COUNT:
+            LOGGER.warning("布局数量异常：炮台 %d/%d，城墙 %d/%d",
+                           len(tower_sites), TOWER_COUNT,
+                           len(walls), WALL_COUNT)
+
         return cls(
-            corner=corner,
+            corner="br" if mirrored else "tl",
+            mirrored=mirrored,
             footprint=footprint,
-            ring_weapon=tuple(sorted(ring_weapon)),
-            ring_wall=tuple(sorted(ring_wall)),
-            tower_sites=tower_sites,
-            wall_sites=wall_sites,
-            stands=stands,
+            tower_sites=tuple(tower_sites),
+            stands=tuple(stands),
+            wall_sites=tuple(walls),
+            slot_index=slot_index,
         )
 
-    def wall_set(self) -> frozenset[Pos]:
-        """城墙选址集合（按坐标去重后便于 in 判断）。"""
-        return frozenset(self.wall_sites)
-
-
-def _corner_of(turn: Turn, station: Unit) -> str:
-    """判断基地在左上角还是右下角（敌方在斜对角）。"""
-    if turn.our_type == TEAM_DEFENDER:
-        return "br"
-    if turn.our_type:
-        return "tl"
-    # 报文缺 type 时退化为几何判断：X 偏左且 Y 偏上就是左上角。
-    left = station.pos.x < turn.width / 2
-    top = station.pos.y > turn.height / 2
-    return "tl" if left and top else "br"
-
-
-def _ring(turn: Turn, footprint: tuple[Pos, ...], radius: int) -> list[Pos]:
-    """与基地 2*2 外形的切比雪夫距离恰为 radius 的所有合法空地。"""
-    xs = [pos.x for pos in footprint]
-    ys = [pos.y for pos in footprint]
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    cells: list[Pos] = []
-    # 只需在基地外扩 radius 的方框内枚举。
-    for x in range(xmin - radius, xmax + radius + 1):
-        for y in range(ymin - radius, ymax + radius + 1):
-            pos = Pos(x, y)
-            if pos in footprint:
-                continue                                   # 基地自身不算
-            if min(distance(pos, cell) for cell in footprint) != radius:
-                continue                                   # 只要正好这一圈
-            if turn.land(pos):                             # 排除矿区/商店等中立元素
-                cells.append(pos)
-    return cells
-
-
-def _wall_shape(footprint: tuple[Pos, ...], corner: str) -> list[Pos]:
-    """C 形护罩的 10 个理想格：朝敌一侧竖排 6 格，顶行/底行各再向内延伸 2 格。"""
-    xs = [pos.x for pos in footprint]
-    ys = [pos.y for pos in footprint]
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    if corner == "tl":
-        # 基地在左上角 -> 敌人在右下 -> 封右侧，开口留在左（背向敌人）。
-        col_x, arm = xmax + 2, -1
-    else:
-        # 基地在右下角 -> 敌人在左上 -> 封左侧，开口留在右。
-        col_x, arm = xmin - 2, 1
-    # 竖排 6 格：从基地下沿再往下 2 格，到上沿再往上 2 格。
-    cells = [Pos(col_x, y) for y in range(ymin - 2, ymax + 3)]
-    # 顶行/底行各向内（朝基地方向）延伸 2 格，形成 "C" 的两条短臂。
-    cells.append(Pos(col_x + arm, ymax + 2))
-    cells.append(Pos(col_x + 2 * arm, ymax + 2))
-    cells.append(Pos(col_x + arm, ymin - 2))
-    cells.append(Pos(col_x + 2 * arm, ymin - 2))
-    return cells
-
-
-def _wall_sites(
-    turn: Turn,
-    footprint: tuple[Pos, ...],
-    ring_wall: list[Pos],
-    corner: str,
-) -> tuple[Pos, ...]:
-    """把理想的 C 形落到合法空地上，凑不够 10 格就用外圈剩余格子补齐。"""
-    ideal = [pos for pos in _wall_shape(footprint, corner) if turn.land(pos)]
-    sites = list(ideal)
-    if len(sites) < WALL_COUNT:
-        # 基地贴边导致理想形状被裁掉时，用外圈其它空格补齐（优先离原缺口最近的）。
-        spare = sorted(
-            (pos for pos in ring_wall if pos not in sites),
-            key=lambda pos: (
-                min((distance(pos, q) for q in ideal), default=0),
-                pos.x,
-                pos.y,
-            ),
-        )
-        sites.extend(spare[: WALL_COUNT - len(sites)])
-    return tuple(sites)
-
-
-def _pick_stand(
-    turn: Turn,
-    tower: Pos,
-    footprint: tuple[Pos, ...],
-    wall_set: frozenset[Pos],
-    towers: set[Pos],
-    stands: set[Pos],
-    ring_weapon: list[Pos],
-    enemy: Pos,
-) -> Pos | None:
-    """给一座武器挑一个操控站位：合法、未被占用、尽量靠向基地后方。
-
-    额外要求站位至少有 2 个可通行邻格：否则队友停在自己的站位上时，
-    就会把只有一个入口的站位彻底堵死（实战踩过这个坑）。
-    """
-    # 把「所有已定/待定的建筑」都当作障碍，用来估算某格还剩几个出口。
-    static = set(wall_set) | set(towers) | set(stands)
-    for unit in turn.ours:
-        static.update(turn.footprint_of(unit))
-
-    def degree(pos: Pos) -> int:
-        """该格周围还有几个可通行、且不会变成建筑的格子。"""
-        return sum(
-            1 for step in neighbours(pos) if turn.land(step) and step not in static
-        )
-
-    options = [
-        pos
-        for pos in neighbours(tower)          # 必须紧贴武器才能操控
-        if pos not in footprint
-        and pos not in wall_set
-        and pos not in towers
-        and pos not in stands
-        and turn.land(pos)
-        and degree(pos) >= 2                  # 不能选死胡同
-    ]
-    if not options:
+    def slot_for(self, unit: Unit, used: set[int]) -> int | None:
+        """给角色分配专属槽位：优先按 unit_id 末两位，认不出再按兵种兜底。"""
+        suffix = str(unit.unit_id)[-2:]
+        index = self.slot_index.get(suffix)
+        if index is not None and index not in used:
+            return index
+        prefer = ("11",) if unit.kind == PIONEER else ("10", "12")
+        for key in prefer:
+            index = self.slot_index.get(key)
+            if index is not None and index not in used:
+                return index
         return None
-    options.sort(
-        key=lambda pos: (
-            0 if pos in ring_weapon else 1,      # 优先基地外一圈
-            -distance(pos, enemy),               # 再优先远离敌人（更安全）
-            pos.x,
-            pos.y,
-        )
-    )
-    return options[0]
 
-
-def _tower_sites(
-    turn: Turn,
-    footprint: tuple[Pos, ...],
-    ring_weapon: list[Pos],
-    wall_sites: tuple[Pos, ...],
-) -> tuple[tuple[Pos, ...], tuple[Pos, ...]]:
-    """先定 3 个朝向敌人的武器位（彼此留间隔），再给它们配站位。
-
-    必须分两步：某个站位会不会被堵死，取决于「所有」武器位最终落在哪，
-    如果先配一个再配下一个，就会算出过于乐观的出口数。
-    """
-    enemy = turn.enemy_station_pos() or Pos(turn.width // 2, turn.height // 2)
-    wall_set = frozenset(wall_sites)
-    # 离敌人越近越优先，这样武器尽量顶在来袭方向上。
-    ordered = sorted(
-        ring_weapon, key=lambda pos: (distance(pos, enemy), pos.x, pos.y)
-    )
-
-    # 第一步：选 3 个武器位，先要求彼此不相邻（spacing=2），凑不齐再放宽到相邻也行。
-    chosen: list[Pos] = []
-    for spacing in (2, 1):
-        for cand in ordered:
-            if len(chosen) >= TOWER_COUNT:
-                break
-            if cand in chosen:
-                continue
-            if any(distance(cand, other) < spacing for other in chosen):
-                continue
-            chosen.append(cand)
-        if len(chosen) >= TOWER_COUNT:
-            break
-
-    # 第二步：给每个武器位配站位；配不到站位的武器位就放弃，顺延到下一个候选。
-    planned = set(chosen)
-    towers: list[Pos] = []
-    stands: list[Pos] = []
-    for cand in list(chosen) + [pos for pos in ordered if pos not in planned]:
-        if len(towers) >= TOWER_COUNT:
-            break
-        if cand in stands:
-            continue
-        stand = _pick_stand(
-            turn, cand, footprint, wall_set, planned, set(stands),
-            ring_weapon, enemy,
-        )
-        if stand is None:
-            continue
-        towers.append(cand)
-        stands.append(stand)
-    return tuple(towers), tuple(stands)
+def _is_mirrored(turn: Turn, station: Unit) -> bool:
+    """需求口径：基地 x<10 用原布局，x>10 用镜像；正好 10 时按阵营判断。"""
+    if station.pos.x > MIRROR_THRESHOLD_X:
+        return True
+    if station.pos.x < MIRROR_THRESHOLD_X:
+        return False
+    return turn.our_type == TEAM_DEFENDER
 
 
 # --------------------------------------------------------------------- 记忆
@@ -274,6 +199,8 @@ class TaskState:
     submitted_round: int | None = None   # 提交答案的回合
     answer: str = ""                     # 已提交的答案
     done: int = 0                        # 已完成任务数
+    progress_round: int = 0              # 最近一次「有进展」的回合，用于识别卡死
+    accept_retried: bool = False         # acceptTask 是否已经补发过一次
 
 
 class Memory:
@@ -290,7 +217,7 @@ class Memory:
         self.issued_round: int = 0
         self.bad_build: set[Pos] = set()         # 试探失败的建造点（黑名单）
         self.blocked_step: dict[int, Pos] = {}   # 上一回合被碰撞挡住的落点
-        self.boss: dict = {"phase": "wait", "owner": None}   # BOSS 采购状态
+        self.boss: dict = {"phase": "wait", "owner": None, "blocked": False}   # BOSS 采购状态
         self.task = TaskState()
         self.task_points: list[Pos] = []         # 第一天要做的自进化任务点
         self.ore_target: dict[int, tuple[Pos, str, int]] = {}   # role_id -> (矿点, 矿种, 目标块数)
@@ -305,6 +232,11 @@ class Memory:
             self.plan = Plan.build(turn)
         if self.plan is not None and self.stone_worker is None:
             self._assign_roles(turn)
+
+        # 判题器可能第 1 回合还没下发任务点（或当时开拓者不在场）：
+        # 只要还没拿到就每回合补一次，否则开拓者会一整天没任务可做。
+        if not self.task_points and turn.player_tasks:
+            self.task_points = [task.pos for task in turn.player_tasks]
 
         # 用「上一回合下发的指令」+「本回合返回的合法性」推断失败原因。
         for role_id, ok in turn.action_results.items():
@@ -354,19 +286,17 @@ class Memory:
             # 只有一个工人时仍然优先保证火箭，石墙退居其次。
             self.tower_worker = self.stone_worker
 
-        # 站位分配：把「离敌人最远（最安全）」的站位给开拓者（血量最低），
-        # 其余按角色 id 顺序补齐。
-        order = sorted(
-            range(len(plan.stands)),
-            key=lambda index: -distance(plan.stands[index], _enemy_of(turn)),
-        )
-        holders = list(turn.controllable())
-        pioneer = turn.pioneer()
-        if pioneer is not None:
-            holders = [pioneer] + [u for u in holders if u.unit_id != pioneer.unit_id]
-        for slot, unit in zip(order, holders):
-            self.stand_of[unit.unit_id] = plan.stands[slot]
-            self.tower_of[unit.unit_id] = plan.tower_sites[slot]
+        # 站位 / 炮台绑定：需求指定按 unit_id 末两位（10/11/12）一一对应，
+        # 每个人固定守自己的那一格、操控自己那一座炮台。
+        used: set[int] = set()
+        for unit in turn.controllable():
+            index = plan.slot_for(unit, used)
+            if index is None:
+                LOGGER.warning("角色 %s(%s) 没分到站位槽", unit.unit_id, unit.kind)
+                continue
+            used.add(index)
+            self.stand_of[unit.unit_id] = plan.stands[index]
+            self.tower_of[unit.unit_id] = plan.tower_sites[index]
 
         # 任务点按报文给定顺序排列，策略层依次去做。
         self.task_points = [task.pos for task in turn.player_tasks]
@@ -430,11 +360,6 @@ def _first_target(command: dict) -> Pos | None:
         return Pos(int(raw["x"]), int(raw["y"]))
     except (KeyError, TypeError, ValueError):
         return None
-
-
-def _enemy_of(turn: Turn) -> Pos:
-    """敌方基地坐标；看不到就用地图中心近似。"""
-    return turn.enemy_station_pos() or Pos(turn.width // 2, turn.height // 2)
 
 
 # 全局单例：整局比赛共用一个 Memory。

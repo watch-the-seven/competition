@@ -77,6 +77,33 @@ def cheb(a: Pos, b: Pos) -> int:
     return max(abs(a.x - b.x), abs(a.y - b.y))
 
 
+def mirror_pos(pos: Pos) -> Pos:
+    """关于地图中心 (20, 15.5) 中心对称——需求里的镜像规则。"""
+    return Pos(40 - pos.x, 31 - pos.y)
+
+
+def expected_layout(station_pos: Pos):
+    """按需求的文字描述**独立**重算一遍布局，用于和策略算出的结果对比。
+
+    故意不复用 agent.memory 的代码：测试要能独立发现实现算错。
+    返回 (炮台槽位表, 槽位->站位, 城墙列表)。
+    """
+    x, y = station_pos.x, station_pos.y - 1          # 需求口径：基地左下角
+    mirrored = station_pos.x > 10
+    def place(dx: int, dy: int) -> Pos:
+        if mirrored:
+            dx, dy = 1 - dx, 1 - dy                  # 镜像时偏移取 (1-dx, 1-dy)
+        return Pos(x + dx, y + dy)
+    rockets = {place(+2, +2): "10", place(+2, -1): "12", place(-1, 0): "11"}
+    stands = {"10": place(+1, +2), "11": place(-2, 0), "12": place(+1, -1)}
+    walls = [
+        place(+1, -2), place(+2, -2), place(+3, -2),
+        place(+3, -1), place(+3, 0), place(+3, +1), place(+3, +2), place(+3, +3),
+        place(+2, +3), place(+1, +3),
+    ]
+    return rockets, stands, walls
+
+
 def footprint_distance(pos: Pos) -> int:
     """该格到基地 2x2 外形的距离：1 = 武器区，2 = 城墙区。"""
     return min(cheb(pos, cell) for cell in FOOTPRINT)
@@ -100,26 +127,52 @@ class World:
     """
 
     def __init__(self, seed: int = 7, vendor_prices: dict | None = None,
-                 llm_mode: str = "answer", task_gold: int = 80) -> None:
+                 llm_mode: str = "answer", task_gold: int = 80,
+                 faults: dict | None = None, mirror: bool = False) -> None:
         self.rng = random.Random(seed)
         self.vendor_prices = dict(vendor_prices or VENDOR_PRICES)
         self.llm_mode = llm_mode      # "answer"=正常作答, "cmd_only"=只会要命令（触发兜底提交）
         self.task_gold = task_gold    # 单个自进化任务的金币奖励（两个合计 2*task_gold）
+        # 用来模拟判题器/LLM 不回包的异常场景，验证策略不会僵死：
+        #   tasks_from_round  该回合之前不下发 playerTasks
+        #   no_phase_task     acceptTask 后一直不给任务原文
+        #   no_llm_resp       prompt 之后一直不给 llmResp
+        #   no_health         roles 里不带 health 字段（缺失不能被当成阵亡）
+        self.faults = dict(faults or {})
+        # mirror=True 时把整张地图做中心对称，用来验证「右下角那一方」的镜像布局。
+        self.mirror = mirror
+        self.footprint = (
+            tuple(mirror_pos(p) for p in FOOTPRINT) if mirror else FOOTPRINT
+        )
+        if mirror:
+            # 注意：中心对称会把「左上角」映成对面基地的「右下角」，
+            # 所以镜像后的 station pos 要重新取 2x2 的左上角（min x, max y）。
+            xs = [p.x for p in self.footprint]
+            ys = [p.y for p in self.footprint]
+            self.station_pos = Pos(min(xs), max(ys))
+        else:
+            self.station_pos = STATION_POS
+        self.enemy_station = mirror_pos(ENEMY_STATION) if mirror else ENEMY_STATION
+        self.team_type = "defender" if mirror else "challenger"
         self.round_no = 0
         self.gold = 75                # 任务书 4.5.3：初始 75 金，刚好够 3 座火箭
         self.score = 0
-        self.zones: dict[Pos, str] = dict(BASE_ZONES)
+        self.zones: dict[Pos, str] = (
+            {mirror_pos(pos): kind for pos, kind in BASE_ZONES.items()}
+            if mirror else dict(BASE_ZONES)
+        )
         self.mine_left: dict[Pos, int] = {          # 每个矿还剩几次可采
-            pos: MINE_CAPACITY for pos, kind in BASE_ZONES.items()
+            pos: MINE_CAPACITY for pos, kind in self.zones.items()
             if kind in ("stone", "iron", "copper")
         }
         # 我方单位：两个工人 + 开拓者 + 基地，坐标取自样例报文。
         self.units: dict[int, dict] = {}
-        for unit_id, pos, kind in (
+        for unit_id, home, kind in (
             (10010, Pos(5, 23), "worker"),
             (10011, Pos(10, 12), "pioneer"),
             (10012, Pos(10, 16), "worker"),
         ):
+            pos = mirror_pos(home) if mirror else home
             self.units[unit_id] = {
                 "id": unit_id, "pos": pos, "roleType": kind, "health": 220,
                 "level": 0, "cooldown": 0, "attackRange": 0,
@@ -127,7 +180,7 @@ class World:
                 "backpack": [],
             }
         self.units[10013] = {
-            "id": 10013, "pos": STATION_POS, "roleType": "station",
+            "id": 10013, "pos": self.station_pos, "roleType": "station",
             "health": 1500, "level": 1, "cooldown": 0, "attackRange": 0,
             "backPackCapability": 0, "backpack": [],
         }
@@ -145,7 +198,9 @@ class World:
         self.events: dict = {
             "accepted": 0, "submitted": 0, "answers": [],
             "boss_bought": None, "boss_used": None, "gold_200": None,
+            "boss_bought_times": 0,   # BOSS 令被买了几次（超过 1 次就是重复采购）
             "attacks": 0, "damage": 0, "bad_shots": 0,
+            "shots": [],            # (操控者id, 被操控炮台坐标)
         }
         self.last_response: dict = {"roleCommandMap": {}, "prompt": "", "executeCmd": ""}
         self.last_actions: dict[int, str] = {}
@@ -153,7 +208,7 @@ class World:
     # ------------------------------------------------------------- 序列化
     def roles(self) -> list[dict]:
         """把内部单位格式转成报文里的 Role 数组。"""
-        return [
+        rows = [
             {
                 "id": unit["id"], "pos": {"x": unit["pos"].x, "y": unit["pos"].y},
                 "roleType": unit["roleType"], "health": unit["health"],
@@ -164,6 +219,10 @@ class World:
             }
             for unit in self.units.values()
         ]
+        if self.faults.get("no_health"):
+            for row in rows:
+                row.pop("health", None)   # 模拟报文没带 health 字段
+        return rows
 
     def payload(self) -> dict:
         """拼出本回合的 Request，字段与 docs/request.txt 完全同构。"""
@@ -177,9 +236,9 @@ class World:
                 ],
             },
             "teamOur": {
-                "type": "challenger", "teamId": "1", "teamName": "smoke",
+                "type": self.team_type, "teamId": "1", "teamName": "smoke",
                 "goldNum": self.gold, "totalScore": self.score,
-                "playerTasks": [
+                "playerTasks": [] if self.round_no < self.faults.get("tasks_from_round", 1) else [
                     {"taskType": "自进化类1", "taskPosition": {"x": 14, "y": 14},
                      "coldDownRounds": 0, "scoreReward": 50,
                      "goldReward": self.task_gold,
@@ -192,13 +251,13 @@ class World:
                 "roles": self.roles(),
             },
             "teamEnemy": {"roles": [
-                {"id": 20013, "pos": {"x": ENEMY_STATION.x, "y": ENEMY_STATION.y},
+                {"id": 20013, "pos": {"x": self.enemy_station.x, "y": self.enemy_station.y},
                  "roleType": "station", "health": 1500, "level": 1},
             ]},
             "robot": {"roles": [
                 {"id": r["id"], "pos": {"x": r["pos"].x, "y": r["pos"].y},
                  "roleType": r["kind"], "health": r["health"],
-                 "abnormalState": "", "targetTeam": "challenger"}
+                 "abnormalState": "", "targetTeam": self.team_type}
                 for r in self.robots.values()
             ]},
             "phaseTask": self.phase_task,
@@ -222,12 +281,16 @@ class World:
         }
 
     # ------------------------------------------------------------- 规则
+    def band(self, pos: Pos) -> int:
+        """该格到基地 2x2 外形的距离：1 = 武器区，2 = 城墙区。"""
+        return min(cheb(pos, cell) for cell in self.footprint)
+
     def occupied(self) -> set[Pos]:
         """当前被占用的格子：中立元素 + 我方单位 + 机器人。"""
         cells: set[Pos] = {pos for pos in self.zones}
         for unit in self.units.values():
             if unit["roleType"] == "station":
-                cells.update(FOOTPRINT)          # 基地占 4 格
+                cells.update(self.footprint)     # 基地占 4 格
             else:
                 cells.add(unit["pos"])
         cells.update(robot["pos"] for robot in self.robots.values())
@@ -249,7 +312,7 @@ class World:
         """矿采空后在随机空地重新生成一个（不会落在可建造区里）。"""
         for _ in range(200):
             pos = Pos(self.rng.randint(0, WIDTH - 1), self.rng.randint(0, HEIGHT - 1))
-            band = footprint_distance(pos)
+            band = self.band(pos)
             if band in (1, 2):          # 矿区不会生成在可建造区域内
                 continue
             if pos in self.zones or pos in self.occupied():
@@ -287,9 +350,12 @@ class World:
                 if name in unit["backpack"]:
                     unit["backpack"].remove(name)
             elif action == "acceptTask":
-                # 简化：一接任务就立刻下发任务原文。
+                # 简化：一接任务就立刻下发任务原文（no_phase_task 时故意不下发）。
                 self.events["accepted"] += 1
-                self.phase_task = "示例任务：请在沙盒中计算 1+1 并给出答案。"
+                self.phase_task = (
+                    "" if self.faults.get("no_phase_task")
+                    else "示例任务：请在沙盒中计算 1+1 并给出答案。"
+                )
             elif action == "submitAnswer":
                 self.events["submitted"] += 1
                 answer = str(command.get("taskAnswer") or "").strip()
@@ -315,7 +381,7 @@ class World:
         """按「外一圈=武器、再外一圈=城墙」校验建造区，并扣资源。"""
         if cheb(unit["pos"], target) > 1 or target in self.occupied():
             return False
-        band = footprint_distance(target)
+        band = self.band(target)
         if name == ROCKET:
             if band != 1:
                 return False                 # 火箭必须建在武器可建造区
@@ -392,6 +458,7 @@ class World:
         unit["backpack"].extend([name] * num)
         if name == BOSS_ORDER:
             self.events["boss_bought"] = self.round_no
+            self.events["boss_bought_times"] += 1
         return True
 
     def _use(self, unit: dict, command: dict) -> bool:
@@ -410,6 +477,9 @@ class World:
             return
         tower = self.units.get(tower_id)
         self.events["attacks"] += 1
+        controller = command.get("controllerId")
+        if tower is not None and controller is not None:
+            self.events["shots"].append((int(controller), tower["pos"]))
         # 超出射程算「无效射击」，用来抓策略层的低级错误。
         if tower is not None and cheb(tower["pos"], target) > tower["attackRange"]:
             self.events["bad_shots"] += 1
@@ -435,7 +505,9 @@ class World:
         if self.pending_llm:
             self.pending_llm = False
             self.task_stage += 1
-            if self.llm_mode == "cmd_only":
+            if self.faults.get("no_llm_resp"):
+                pass                                   # 模拟 LLM 一直不回包
+            elif self.llm_mode == "cmd_only":
                 self.llm_resp = "CMD: echo 1+1"        # 永远只给命令，逼出兜底分支
             else:
                 self.llm_resp = "CMD: echo 1+1" if self.task_stage % 2 else "ANSWER: 2"
@@ -458,7 +530,7 @@ class World:
                     continue
                 if step in occupied:
                     continue
-                candidate = (cheb(step, STATION_POS), step)
+                candidate = (cheb(step, self.station_pos), step)
                 if best is None or candidate[0] < best[0]:
                     best = candidate
             if best is not None and best[0] < cheb(robot["pos"], STATION_POS):
@@ -487,8 +559,10 @@ class World:
 def check_goals(world: "World") -> tuple[int, int, list[str]]:
     """校验第 70 回合的结构目标，返回 (火箭数, 城墙数, 失败原因)。
 
-    同时校验「建造区是否用对」——火箭必须在外一圈、城墙必须在再外一圈，
-    这样如果布局算错了，测试会直接报出来而不是默默通过。
+    除了数量，还逐格核对**需求写死的坐标**：
+    炮台必须是 (x+2,y+2)/(x+2,y-1)/(x-1,y)，城墙必须是那 10 格，
+    并且 10/11/12 结尾的角色必须站在各自的专属站位上。
+    这样布局口径一旦算错（例如把基地 pos 当成左下角），测试会立刻报出来。
     """
     snapshot = getattr(world, "snapshot_70", None)
     if snapshot is None:
@@ -500,17 +574,27 @@ def check_goals(world: "World") -> tuple[int, int, list[str]]:
         problems.append(f"火箭数量 {len(rockets)} != 3")
     if len(walls) != 10:
         problems.append(f"城墙数量 {len(walls)} != 10")
-    for rocket in rockets:
-        if footprint_distance(rocket["pos"]) != 1:
-            problems.append(f"火箭 {rocket['pos']} 不在武器可建造区")
-    for wall in walls:
-        if footprint_distance(wall["pos"]) != 2:
-            problems.append(f"城墙 {wall['pos']} 不在城墙可建造区")
+
+    want_rockets, want_stands, want_walls = expected_layout(world.station_pos)
+    got_rockets = {r["pos"]: None for r in rockets}
+    if set(got_rockets) != set(want_rockets):
+        problems.append(f"炮台坐标不符：实际 {sorted(map(str, got_rockets))} "
+                        f"期望 {sorted(map(str, want_rockets))}")
+    if {w["pos"] for w in walls} != set(want_walls):
+        problems.append(f"城墙坐标不符：实际 {sorted(str(w['pos']) for w in walls)}")
+
+    # 每个角色必须站在自己的专属站位上（按 unit_id 末两位）
     for unit_id in (10010, 10011, 10012):
         unit = snapshot["units"].get(unit_id)
         if unit is None:
             problems.append(f"角色 {unit_id} 不见了")
             continue
+        slot = str(unit_id)[-2:]
+        want = want_stands.get(slot)
+        if want is not None and unit["pos"] != want:
+            problems.append(
+                f"第 70 回合角色 {unit_id}(槽{slot}) 在 {unit['pos']}，期望 {want}"
+            )
         if not any(cheb(unit["pos"], r["pos"]) <= 1 for r in rockets):
             problems.append(
                 f"第 70 回合角色 {unit_id} 在 {unit['pos']}，不在任何火箭旁"
@@ -520,15 +604,16 @@ def check_goals(world: "World") -> tuple[int, int, list[str]]:
 
 def run(prices: dict, seed: int = 7, expect_boss: bool = True,
         min_gold: int = 0, llm_mode: str = "answer",
-        task_gold: int = 80) -> list[str]:
+        task_gold: int = 80, faults: dict | None = None,
+        min_submitted: int = 2, mirror: bool = False) -> list[str]:
     """跑完第一天 130 回合，返回失败原因列表（空表示全部通过）。
 
-    参数都是为了让同一个函数能跑不同场景：矿价、任务奖励、LLM 行为等。
+    参数都是为了让同一个函数能跑不同场景：矿价、任务奖励、LLM 行为、回包故障等。
     """
     # 策略的记忆是模块级单例，跑新场景前必须清空，否则会带着上一局的进度。
     memory_module.MEMORY.__init__()
     world = World(seed=seed, vendor_prices=prices, llm_mode=llm_mode,
-                  task_gold=task_gold)
+                  task_gold=task_gold, faults=faults, mirror=mirror)
     trace = []
     for round_no in range(1, 131):
         world.round_no = round_no
@@ -562,10 +647,27 @@ def run(prices: dict, seed: int = 7, expect_boss: bool = True,
     print(f"BOSS 令购买回合：{events['boss_bought']} / 使用回合：{events['boss_used']}")
     print(f"夜晚开火 {events['attacks']} 次，累计伤害 {events['damage']}，"
           f"超出射程的射击 {events['bad_shots']} 次")
+    print(f"操控配对：{sorted({f'{c}->{p}' for c, p in events.get('shots', [])})}")
 
     # ---- 断言 ----
-    if events["submitted"] < 2:
-        failures.append(f"完成的自进化任务数 {events['submitted']} < 2")
+    if events["submitted"] < min_submitted:
+        failures.append(f"完成的自进化任务数 {events['submitted']} < {min_submitted}")
+    # 回归点：BOSS 令只允许买一张（曾经因为缺 done 判断而买了两张，白花 200 金）。
+    if events["boss_bought_times"] > 1:
+        failures.append(f"BOSS 令被买了 {events['boss_bought_times']} 次，重复采购")
+    # 操控配对：角色必须操纵「自己槽位对应的那座炮台」。
+    want_rockets, _want_stands, _want_walls = expected_layout(world.station_pos)
+    slot_rocket = {slot: rocket for rocket, slot in want_rockets.items()}
+    for ctrl, tower_pos in events.get("shots", []):
+        slot = str(ctrl)[-2:]
+        want = slot_rocket.get(slot)
+        if want is not None and tower_pos != want:
+            failures.append(
+                f"角色 {ctrl}(槽{slot}) 操控了 {tower_pos}，应操控 {want}"
+            )
+    # 回归点：曾经因为「等 llmResp / 等 phaseTask 没有超时」导致开拓者整局零指令。
+    if memory_module.MEMORY.task.phase == "solve":
+        failures.append("开拓者整局卡死在任务求解阶段（等不到回包且没有超时保护）")
     if events["attacks"] == 0:
         failures.append("夜晚一次都没开火")
     if events["damage"] == 0:
@@ -602,6 +704,20 @@ def main() -> int:
         ("LLM 不作答（兜底提交）",
          {"stone": 1, "iron": 3, "copper": 5},
          {"expect_boss": False, "llm_mode": "cmd_only"}),
+        # 下面三个是「回包故障」回归用例：任何一环不回包都不能让开拓者僵死。
+        ("任务点延迟下发", {"stone": 1, "iron": 3, "copper": 25},
+         {"expect_boss": True, "faults": {"tasks_from_round": 3}}),
+        ("LLM 不回包", {"stone": 1, "iron": 3, "copper": 25},
+         {"expect_boss": False, "faults": {"no_llm_resp": True}}),
+        ("任务原文不下发", {"stone": 1, "iron": 3, "copper": 25},
+         {"expect_boss": False, "faults": {"no_phase_task": True},
+          "min_submitted": 0}),
+        # roles 不带 health：绝不能把缺失当成阵亡，否则全员都不被调度。
+        ("roles 缺 health 字段", {"stone": 1, "iron": 3, "copper": 25},
+         {"expect_boss": True, "faults": {"no_health": True}}),
+        # 镜像世界：验证「右下角那一方」的布局是左下角布局的中心对称。
+        ("镜像基地(右下角)", {"stone": 1, "iron": 3, "copper": 25},
+         {"expect_boss": True, "mirror": True}),
     ]
     failures: list[str] = []
     for title, prices, options in scenarios:

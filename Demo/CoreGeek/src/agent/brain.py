@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from . import grid
@@ -24,7 +25,10 @@ from .memory import MEMORY
 from .protocol import (
     BOSS_ORDER,
     CONTROLLABLE_TYPES,
+    COPPER,
     DAY_ONE_LAST_ROUND,
+    IRON,
+    KNOWN_KINDS,
     PIONEER,
     ROCKET,
     ROCKET_CENTER_DAMAGE,
@@ -50,6 +54,8 @@ from .protocol import (
     use_command,
 )
 
+LOGGER = logging.getLogger(__name__)
+
 # --------------------------------------------------------------------- 调参
 # 这些数字是策略的「手感开关」，改这里就能调整行为，不用动逻辑。
 SELL_BATCH = 20            # 一趟最多背 20 块（= 需求里说的「采两个矿」）再去卖
@@ -61,13 +67,49 @@ MIN_YIELD = 3              # 少于 3 块就不值得专门跑一趟
 MAX_CHAIN_LEG = 8          # 背着货时，只顺路再采一次近距离的矿
 TASK_COUNT = 2             # 第一天要完成的自进化任务数
 TASK_BUDGET = 14           # 预估单个任务占用的回合数（含往返与 LLM 往返）
+# 需求指定的挖矿分工：尾号 10 的工人挖铁、尾号 12 的工人挖铜。
+# 分开矿种还有个附带好处：两个工人天然不会抢同一个矿。
+SLOT_ORE: dict[str, str] = {"10": IRON, "12": COPPER}
 TASK_LLM_MAX = 6           # 单个任务最多几轮 LLM 往返
 TASK_CMD_MAX = 4           # 单个任务最多几次沙盒执行
+# 下面三个是「防僵死」超时：判题器/LLM/沙盒任何一环不回包时，
+# 都必须在有限回合内放弃或兜底，绝不能让开拓者整局僵在原地。
+LLM_WAIT_LIMIT = 3         # 发出 prompt 后最多等几回合 llmResp
+ACCEPT_WAIT_LIMIT = 3      # 发出 acceptTask 后最多等几回合任务原文
+TASK_STALL_LIMIT = 5       # 任何阶段连续几回合毫无进展就放弃该任务点
+TASK_WAIT_ROUNDS = 10      # 任务点迟迟不下发时，最多等几个回合再放开拓者去干别的
 FIRE_MIN_VALUE = 40.0      # 一轮齐射至少打出「2 个机器人份」的伤害才开火
 URGENT_BASE_DISTANCE = 9   # 敌人已经逼近基地到这个距离就无条件开火
 
 
 # --------------------------------------------------------------------- 入口
+def _log_roster(turn: Turn) -> None:
+    """第一次收到报文时，把「解析出了哪些我方单位」打进日志。
+
+    排查「某个角色一直不动」时第一件事就是看它有没有被解析出来、kind 对不对、
+    health 是不是 0——这三样任一出问题，该角色就会被排除在调度之外。
+    """
+    LOGGER.info(
+        "我方单位(id/kind/health): %s",
+        [(unit.unit_id, unit.kind, unit.health) for unit in turn.ours],
+    )
+    LOGGER.info(
+        "可调度角色: %s | 任务点: %s",
+        [unit.unit_id for unit in turn.controllable()],
+        [str(task.pos) for task in turn.player_tasks],
+    )
+    # 下面几条是最容易导致「角色不动」的报文问题，直接给出告警。
+    unknown = sorted({unit.kind for unit in turn.ours} - KNOWN_KINDS)
+    if unknown:
+        LOGGER.warning("报文里出现未识别的 roleType: %s（这些单位不会被调度）", unknown)
+    if turn.station() is None:
+        LOGGER.warning("报文里没有基地(station)：布局与归位都会失效")
+    if turn.pioneer() is None:
+        LOGGER.warning("报文里没有可用的开拓者(pioneer)")
+    if not turn.player_tasks:
+        LOGGER.warning("报文里没有 playerTasks：开拓者将无任务可做")
+
+
 def decide(payload: dict[str, Any]) -> dict[str, Any]:
     """判题器每回合调用一次：吃 Request，吐 Response。
 
@@ -76,6 +118,8 @@ def decide(payload: dict[str, Any]) -> dict[str, Any]:
     """
     turn = Turn.load(payload)
     with MEMORY.lock:
+        if MEMORY.last_round == 0:
+            _log_roster(turn)               # 整局只打一次，便于赛后排查
         MEMORY.begin(turn)                      # 先解释上一回合哪些动作失败了
         response = empty_response()             # 默认不下任何指令
         if turn.is_day:
@@ -140,10 +184,7 @@ def _assign_jobs(turn: Turn) -> dict[int, str]:
         if role.unit_id in jobs:
             continue
         if role.kind == PIONEER:
-            jobs[role.unit_id] = (
-                "task" if MEMORY.task.done < TASK_COUNT and MEMORY.task.phase != "halt"
-                else "return"
-            )
+            jobs[role.unit_id] = "task" if _pioneer_busy(turn) else "return"
         elif role.unit_id == MEMORY.tower_worker:
             # 先造满 3 座火箭，再去挣金币。
             jobs[role.unit_id] = (
@@ -160,6 +201,18 @@ def _assign_jobs(turn: Turn) -> dict[int, str]:
         else:
             jobs[role.unit_id] = _roam_job(turn)
     return jobs
+
+
+def _pioneer_busy(turn: Turn) -> bool:
+    """开拓者手头是否还有任务要做（没任务时就该放它去干别的，比如采购）。"""
+    state = MEMORY.task
+    if state.done >= TASK_COUNT or state.phase == "halt":
+        return False
+    if not MEMORY.task_points:
+        # 任务点还没下发（判题器可能晚几回合才给）：再等等，
+        # 否则会一上来就把开拓者抓去商店，任务下发后它已经走远了。
+        return turn.round_no <= TASK_WAIT_ROUNDS
+    return state.index < len(MEMORY.task_points)
 
 
 def _roam_job(turn: Turn) -> str:
@@ -314,19 +367,22 @@ def _ore_step(
         MEMORY.ore_target.pop(role.unit_id, None)
     want = target[2] if target is not None else SELL_BATCH   # 这趟计划背到多少块
 
-    # 背够了 / 背包快满 -> 先去卖，再回来继续。
-    if carried and vendor is not None and (total >= want or role.backpack_full):
-        _go_sell(turn, role, carried, claimed, commands)
-        return
+    # 该去卖了吗？三种情况：背够计划量 / 背包快满 / 这个矿已经采空了。
+    # 「矿采空就立刻去卖」很重要：金币越早到账，开拓者越来得及在
+    # 归位截止前把 BOSS 令买下来，而不是为了多凑几块矿把卖矿拖到入夜。
+    exhausted = target is None
+    if carried and vendor is not None and (
+        exhausted or total >= want or role.backpack_full
+    ):
+        if _go_sell(turn, role, carried, claimed, commands):
+            return
 
     if target is None:
-        target = _pick_mine(turn, role)    # 重新挑一个来得及采的矿
+        target = _pick_mine(turn, role)    # 身上没货了，挑一个来得及跑完的矿
         if target is not None:
             MEMORY.ore_target[role.unit_id] = target
     if target is None:
-        # 没有来得及采的矿了：把手上的货卖掉，然后回防。
-        if carried and _go_sell(turn, role, carried, claimed, commands):
-            return
+        # 没有来得及采的矿了：回防。
         _return_step(turn, role, claimed, commands)
         return
 
@@ -370,23 +426,80 @@ def _sell_step(
         _return_step(turn, role, claimed, commands)
 
 
+def _preferred_ores(role: Unit) -> tuple[str, ...]:
+    """这个角色该挖的矿种顺序：需求指定的那种优先，采不到再退而求其次。
+
+    需求：尾号 10 的工人挖铁、尾号 12 的工人挖铜。这样两人不会抢同一个矿；
+    万一地图上该矿种全都不合适（太远/来不及），才退让到另一种矿，避免干站着。
+    """
+    first = SLOT_ORE.get(str(role.unit_id)[-2:])
+    if first is None:
+        return TRADE_ORES
+    return (first,) + tuple(ore for ore in TRADE_ORES if ore != first)
+
+
+def _best_mine_of(
+    turn: Turn,
+    role: Unit,
+    ore: str,
+    carried: int,
+    home_from_vendor: int,
+    taken: set[Pos],
+) -> tuple[Pos, str, int] | None:
+    """在指定矿种里挑「金币收益 / 花费回合」最高的一个矿。"""
+    vendor = turn.vendor_pos()
+    assert vendor is not None
+    price = turn.vendor_prices.get(ore, 0)
+    if price <= 0:
+        return None
+    best: tuple[Pos, str, int] | None = None
+    best_score = 0.0
+    for mine in turn.ore_mines(ore):
+        if mine in MEMORY.bad_build:
+            continue
+        leg_in = _rounds_to(turn, role, mine)
+        if leg_in is None:
+            continue
+        if carried and leg_in > MAX_CHAIN_LEG:
+            continue                       # 背着货别再跑远矿，先把货换成钱
+        leg_out = _rounds_between(turn, mine, vendor)
+        if leg_out is None:
+            continue
+        # 固定开销（去程 + 回程 + 交易 + 卖完回家）之后还剩多少回合可以采。
+        slack = ORE_DEADLINE - (
+            turn.round_no + leg_in + leg_out + 1 + home_from_vendor
+        )
+        room = SELL_BATCH - carried        # 批量上限的剩余空间
+        want = min(MINE_YIELD, room, slack)
+        if want < MIN_YIELD:
+            continue                       # 采不了几块，不值得专门跑一趟
+        score = price * want / (leg_in + want + leg_out + 1)
+        if mine in taken:
+            score *= 0.5                   # 另一个工人已经盯上的矿就别抢
+        if score > best_score:
+            best, best_score = (mine, ore, carried + want), score
+    return best
+
+
 def _pick_mine(
     turn: Turn, role: Unit
 ) -> tuple[Pos, str, int] | None:
     """挑一个「还来得及跑完」的矿，返回 (矿点, 矿种, 这趟准备背到多少块)。
 
-    一次完整的采矿循环 = 走到矿 -> 采 N 块 -> 走到小贩 -> 卖 -> 走回火箭旁，
-    必须能在第 70 回合前收尾；否则宁可少采几块（N 调小）也不要半路丢货。
-    评分用「金币收益 / 花费回合」，所以自动会偏好「贵且顺路」的矿。
+    一次完整的采矿循环 = 走到矿 -> 采 N 块 -> 走到小贩 -> 卖 -> 走回站位，
+    必须能在归位截止前收尾；否则宁可少采几块（把 N 调小）也不要半路丢货。
+    先在自己负责的矿种里找；实在没有可行的，才退让到另一种矿。
     """
     vendor = turn.vendor_pos()
     stand = MEMORY.stand_for(role.unit_id)
-    if vendor is None or stand is None:
+    if vendor is None:
         return None
-    home_from_vendor = _rounds_between(turn, vendor, stand)   # 卖完之后回家的路
+    # 万一没分到站位（例如武器位没配齐），按「回家 0 回合」乐观估算，
+    # 不要因此彻底放弃采矿——否则整个白天一分钱都挣不到。
+    home_from_vendor = _rounds_between(turn, vendor, stand) if stand else 0
     if home_from_vendor is None:
         return None
-    # 另一个工人已经盯上的矿，评分打对折，避免两人抢同一个。
+    # 另一个角色已经盯上的矿，评分打对折，避免两人抢同一个。
     taken = {
         pos
         for other, entry in MEMORY.ore_target.items()
@@ -395,90 +508,85 @@ def _pick_mine(
     }
     carried = sum(role.count(ore) for ore in TRADE_ORES)
 
-    best: tuple[Pos, str, int] | None = None
-    best_score = 0.0
-    for ore in TRADE_ORES:
-        price = turn.vendor_prices.get(ore, 0)
-        if price <= 0:
-            continue
-        for mine in turn.ore_mines(ore):
-            if mine in MEMORY.bad_build:
-                continue
-            leg_in = _rounds_to(turn, role, mine)
-            if leg_in is None:
-                continue
-            if carried and leg_in > MAX_CHAIN_LEG:
-                continue                   # 背着货别再跑远矿，先把货换成钱
-            leg_out = _rounds_between(turn, mine, vendor)
-            if leg_out is None:
-                continue
-            # 固定开销（往返 + 交易）之后还剩多少回合可以采。
-            slack = ORE_DEADLINE - (
-                turn.round_no + leg_in + leg_out + 1 + home_from_vendor
-            )
-            room = SELL_BATCH - carried    # 背包/批量的剩余空间
-            want = min(MINE_YIELD, room, slack)
-            if want < MIN_YIELD:
-                continue                   # 采不了几块，不值得跑
-            score = price * want / (leg_in + want + leg_out + 1)
-            if mine in taken:
-                score *= 0.5               # 两个工人别抢同一个矿
-            if score > best_score:
-                best, best_score = (mine, ore, carried + want), score
-    return best
+    for ore in _preferred_ores(role):
+        found = _best_mine_of(turn, role, ore, carried, home_from_vendor, taken)
+        if found is not None:
+            return found
+    return None
 
 
 # --------------------------------------------------------------------- BOSS 召唤令
 def _boss_owner(turn: Turn) -> int | None:
-    """决定谁去商店买 BOSS 召唤令；返回角色 id（None 表示暂时不用买）。
+    """决定谁负责买 BOSS 召唤令；返回角色 id（None 表示暂时没人负责）。
 
-    采购状态机（存在 MEMORY.boss["phase"]）：
-        wait -> travel -> use_sent -> done
-    wait 表示还在攒钱；travel 表示已派出采购员；use_sent 表示货已到手、
-    正在使用；done 表示用完收工。
+    采购状态机（存在 MEMORY.boss）：
+        phase: wait -> travel -> use_sent -> done
+        owner: 当前采购员
+        blocked: 曾经因为「再不走就赶不上就位」而放弃过采购
+
+    选人口径（需求）：**开拓者做完两个任务后就去武器商店门口等**，
+    金币一到 200 立刻买、下一回合立刻用，把「等钱」的时间压成 0。
+    开拓者不可用（还在做任务 / 阵亡 / 已经放弃）时，才在金够 200 后
+    派一个「来回都赶得上第 71 回合就位」的角色去补买。
     """
     state = MEMORY.boss
     phase = state["phase"]
     alive = {unit.unit_id for unit in turn.controllable()}
 
+    if phase == "done":
+        return None            # 已经买过且用过了，采购流程结束（否则会重复买第二张）
+
+    # ---- 已有采购员：继续由他负责，直到用完 / 失联 / 必须回防 ----
     if phase != "wait":
         owner = state.get("owner")
-        if owner not in alive:
-            state["phase"], state["owner"] = "wait", None    # 采购员阵亡，重选
-            phase = "wait"
-        elif phase == "use_sent":
-            # 背包里没这个道具了，说明 use 生效，采购流程结束。
-            holder = next(u for u in turn.controllable() if u.unit_id == owner)
-            if BOSS_ORDER not in holder.backpack:
-                state["phase"] = "done"
-                return None
+        holder = next((u for u in turn.controllable() if u.unit_id == owner), None)
+        if holder is None:
+            state["phase"], state["owner"] = "wait", None        # 采购员失联，重选
+        elif phase == "use_sent" and BOSS_ORDER not in holder.backpack:
+            state["phase"] = "done"                              # 已用掉，收工
+            return None
+        elif _must_return(turn, holder):
+            # 再不走就赶不上第 71 回合就位。宁可这次不买也不能缺席夜晚，
+            # 并且记下 blocked，避免下回合又把同一个人派出去来回横跳。
+            state["phase"], state["owner"], state["blocked"] = "wait", None, True
+            LOGGER.info("放弃 BOSS 采购：角色 %s 必须回防", owner)
+            return None
         else:
-            return owner               # 已有采购员，继续由他负责
-    # 到这里 phase == "wait"：判断现在能不能派人。
+            return owner
 
-    if turn.gold < turn.boss_price():
-        return None                    # 钱还不够
     shop = turn.weapon_shop_pos()
     if shop is None:
         return None
 
-    # 挑一个「离商店最近、且来赶得及在入夜前用完」的角色。
+    # ---- 首选：开拓者做完任务了，就让它先去门口等（钱不够也去） ----
+    pioneer = turn.pioneer()
+    if pioneer is not None and not _pioneer_busy(turn) and not state.get("blocked"):
+        state["phase"], state["owner"] = "travel", pioneer.unit_id
+        return pioneer.unit_id
+
+    # ---- 次选：金已经够了，派个来回都赶得上的角色 ----
+    if turn.gold < turn.boss_price() or state.get("blocked"):
+        return None
+
     best: int | None = None
     best_cost: tuple[int, int] | None = None
     for role in turn.controllable():
-        if role.kind == PIONEER and MEMORY.task.done < TASK_COUNT \
-                and MEMORY.task.phase != "halt":
+        if role.kind == PIONEER and _pioneer_busy(turn):
             continue                       # 不打断开拓者跑任务
-        blocked = turn.blocked(role)
-        goals = _adjacent_free(turn, shop, blocked)
+        blocked_cells = set(turn.blocked(role))
+        goals = _adjacent_free(turn, shop, blocked_cells)
         if not goals:
             continue
-        rounds = grid.travel_rounds(turn, role.pos, goals, blocked)
-        if rounds is None:
+        there = grid.travel_rounds(turn, role.pos, goals, frozenset(blocked_cells))
+        if there is None:
             continue
-        if turn.round_no + rounds + 2 > BOSS_USE_DEADLINE:
-            continue                       # 走不到 + 买 + 用，来不及了
-        cost = (rounds, role.unit_id)
+        # 买(1) + 用(1) 之后还得赶回自己的站位，整体必须收在归位截止前。
+        back = _rounds_home_from(turn, role, shop)
+        if back is None:
+            continue
+        if turn.round_no + there + 2 + back > DAY_ONE_LAST_ROUND - RETURN_SLACK:
+            continue
+        cost = (there, role.unit_id)
         if best_cost is None or cost < best_cost:
             best, best_cost = role.unit_id, cost
     if best is not None:
@@ -489,7 +597,7 @@ def _boss_owner(turn: Turn) -> int | None:
 def _boss_step(
     turn: Turn, role: Unit, claimed: set[Pos], commands: dict[str, Any]
 ) -> None:
-    """采购员每回合的动作：走到商店 -> 买 -> 下一回合立刻用。"""
+    """采购员每回合的动作：走到武器商店门口 -> 等钱 -> 买 -> 下一回合立刻用。"""
     if BOSS_ORDER in role.backpack:
         commands[role.unit_id] = use_command(BOSS_ORDER)     # 到手了就马上用
         MEMORY.boss["phase"] = "use_sent"
@@ -502,7 +610,10 @@ def _boss_step(
     if not goals:
         return
     if distance(role.pos, shop) <= 1 or role.pos in goals:
-        commands[role.unit_id] = buy_command(BOSS_ORDER, 1)  # 已经到店，买
+        # 已经到门口。钱够了才买——钱不够就原地等，绝不发无效的 buy
+        # （买到不存在的东西属于指令非法，会计入队伍异常次数）。
+        if turn.gold >= turn.boss_price():
+            commands[role.unit_id] = buy_command(BOSS_ORDER, 1)
         return
     _advance(turn, role, goals, claimed, commands, extra=blocked)
 
@@ -522,28 +633,42 @@ def _task_step(
         return
     point = MEMORY.task_points[state.index]
 
+    # 防僵死兜底：任何阶段连续多回合没有进展（走不动、等不到回包），
+    # 就放弃这个任务点转下一个，绝不让开拓者整天零指令。
+    if state.phase in ("travel", "accept", "solve") \
+            and turn.round_no - state.progress_round > TASK_STALL_LIMIT:
+        _abandon_task(state, turn)
+        _return_step(turn, role, claimed, commands)
+        return
+
     if state.phase == "travel":
-        # 出发前先算总账：来回路程 + 任务预算 + 归位，超了就干脆不做了。
+        # 出发前先算总账：来回路程 + 任务预算 + 归位，超了就跳过这个任务点。
+        # 注意是「跳过」而不是「整体放弃」——另一个任务点可能离得更近、来得及做。
         if not _task_fits(turn, role, point):
-            state.phase = "halt"
+            _abandon_task(state, turn)
             _return_step(turn, role, claimed, commands)
             return
         # 任务领取要求站在任务点周围一格内；注意不能站到点上。
         if role.pos != point and distance(role.pos, point) <= 1:
             state.phase = "accept"
+            _touch(state, turn)
         else:
             blocked = set(turn.blocked(role))
             goals = _adjacent_free(turn, point, blocked)
             if role.pos in goals:
                 state.phase = "accept"      # 本回合刚好走到位，直接进入领取
+                _touch(state, turn)
             else:
-                _advance(turn, role, goals, claimed, commands)
+                if _advance(turn, role, goals, claimed, commands):
+                    _touch(state, turn)
                 return
 
     if state.phase == "accept":
         commands[role.unit_id] = accept_task_command()
         state.phase = "solve"
         state.pending = None
+        state.accept_retried = False
+        _touch(state, turn)
         return
 
     if state.phase == "solve":
@@ -573,22 +698,37 @@ def _task_solve(
     所以用 state.pending 记住「上回合发了什么、这回合在等什么」。
     """
     state = MEMORY.task
+    waited = turn.round_no - state.progress_round
+
     if not turn.phase_task:
-        # 还没收到任务原文；如果已经提交过就说明任务结束了。
+        # acceptTask 发出后任务原文一直没下发：补发一次，再不来就放弃这个任务点。
         if state.submitted_round is not None:
-            _finish_task(state, turn)
+            _finish_task(state, turn)      # 已经提交过，说明任务确实结束了
+            return
+        if waited >= ACCEPT_WAIT_LIMIT:
+            if state.accept_retried:
+                _abandon_task(state, turn)
+            else:
+                commands[role.unit_id] = accept_task_command()
+                state.accept_retried = True
+                _touch(state, turn)
         return
 
     if state.pending == "llm":
-        if not turn.llm_resp:
-            return                       # LLM 回包还没到，原地等待
-        state.pending = None
-        _handle_llm(turn, role, commands, response)
+        if turn.llm_resp:
+            state.pending = None
+            _touch(state, turn)
+            _handle_llm(turn, role, commands, response)
+            return
+        if waited >= LLM_WAIT_LIMIT:
+            # LLM 迟迟不回：把沙盒最后的输出当答案兜底提交，别把任务耗到超时。
+            _submit_fallback(turn, role, commands, state)
         return
 
     if state.pending == "cmd":
-        state.last_output = turn.last_cmd_result     # 沙盒输出到手
+        state.last_output = turn.last_cmd_result     # 沙盒输出到手（可能为空）
         state.pending = None
+        _touch(state, turn)
         _ask_llm(turn, role, commands, response)     # 把输出回灌给 LLM
         return
 
@@ -604,17 +744,12 @@ def _ask_llm(
     """发出一次 prompt；如果轮次已经用尽，就兜底提交，别让任务空转到超时。"""
     state = MEMORY.task
     if state.iterations >= TASK_LLM_MAX:
-        # 把沙盒最后的输出第一行当作答案交上去（有总比没有强）。
-        lines = (state.last_output or "").strip().splitlines()
-        answer = lines[0][:200] if lines else ""
-        commands[role.unit_id] = submit_answer_command(answer)
-        state.answer = answer
-        state.phase = "verify"
-        state.submitted_round = turn.round_no
+        _submit_fallback(turn, role, commands, state)
         return
     response["prompt"] = _build_prompt(turn.phase_task, state)
     state.pending = "llm"
     state.iterations += 1
+    _touch(state, turn)
 
 
 def _handle_llm(
@@ -634,12 +769,14 @@ def _handle_llm(
         state.answer = answer
         state.submitted_round = turn.round_no
         state.phase = "verify"
+        _touch(state, turn)
         return
     if command and state.command_sent < TASK_CMD_MAX:
         response["executeCmd"] = command     # 仅在任务期间可用（接口文档 2.1）
         state.last_command = command
         state.command_sent += 1
         state.pending = "cmd"
+        _touch(state, turn)
         return
     # 既没给答案也没给（可用的）命令：再问一次，轮次用尽后会自动兜底提交。
     _ask_llm(turn, role, commands, response)
@@ -687,10 +824,13 @@ def _extract(text: str, marker: str) -> str | None:
     return None
 
 
-def _finish_task(state: Any, turn: Turn) -> None:
-    """收尾当前任务，并把状态复位以迎接下一个任务点。"""
-    state.done += 1
-    state.index += 1
+def _touch(state: Any, turn: Turn) -> None:
+    """记录「本回合有进展」，供防僵死超时判断使用。"""
+    state.progress_round = turn.round_no
+
+
+def _reset_task(state: Any) -> None:
+    """清空当前任务的临时状态（不改 index/done）。"""
     state.phase = "travel"
     state.pending = None
     state.iterations = 0
@@ -699,6 +839,42 @@ def _finish_task(state: Any, turn: Turn) -> None:
     state.last_command = ""
     state.last_output = ""
     state.answer = ""
+    state.accept_retried = False
+
+
+def _finish_task(state: Any, turn: Turn) -> None:
+    """任务正常收尾（拿到并通过验证），去做下一个任务点。"""
+    state.done += 1
+    state.index += 1
+    _reset_task(state)
+    _touch(state, turn)
+
+
+def _abandon_task(state: Any, turn: Turn) -> None:
+    """放弃当前任务点（超时/卡死），跳过它去做下一个。
+
+    不计入 done，所以不会虚报任务数；如果所有任务点都被跳过，
+    _task_step 会因为 index 越界而转成回防。
+    """
+    state.index += 1
+    _reset_task(state)
+    _touch(state, turn)
+
+
+def _submit_fallback(
+    turn: Turn,
+    role: Unit,
+    commands: dict[str, Any],
+    state: Any,
+) -> None:
+    """兜底提交：把沙盒最后的输出当作答案交上去（有分总比弃权强）。"""
+    lines = (state.last_output or "").strip().splitlines()
+    answer = lines[0][:200] if lines else ""
+    commands[role.unit_id] = submit_answer_command(answer)
+    state.answer = answer
+    state.phase = "verify"
+    state.submitted_round = turn.round_no
+    _touch(state, turn)
 
 
 def _task_fits(turn: Turn, role: Unit, point: Pos) -> bool:
