@@ -28,6 +28,7 @@ python3 tools/mock_judge.py      # HTTP 级联调：把本程序当独立进程�
 | `tools/smoke.py` | 迷你裁判器 + 断言（进程内调用策略） |
 | `tools/mock_judge.py` | HTTP 级联调：真实进程 + 真实 POST，逐条校验接口文档并测时延 |
 | `tools/diagnose.py` | 拿一份真实 Request 报文，逐条讲清楚「为什么某个角色没动作」 |
+| `docs/单回合流程.md` | 从收到 Request 到发出 Response 的完整处理链路与设计理由 |
 
 ## 建造布局（需求给定的固定坐标）
 
