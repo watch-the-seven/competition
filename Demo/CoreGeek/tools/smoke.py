@@ -128,7 +128,8 @@ class World:
 
     def __init__(self, seed: int = 7, vendor_prices: dict | None = None,
                  llm_mode: str = "answer", task_gold: int = 80,
-                 faults: dict | None = None, mirror: bool = False) -> None:
+                 faults: dict | None = None, mirror: bool = False,
+                 robot_target: str = "ours") -> None:
         self.rng = random.Random(seed)
         self.vendor_prices = dict(vendor_prices or VENDOR_PRICES)
         self.llm_mode = llm_mode      # "answer"=正常作答, "cmd_only"=只会要命令（触发兜底提交）
@@ -154,6 +155,8 @@ class World:
             self.station_pos = STATION_POS
         self.enemy_station = mirror_pos(ENEMY_STATION) if mirror else ENEMY_STATION
         self.team_type = "defender" if mirror else "challenger"
+        # 机器人 targetTeam 怎么下发：ours=冲我们来 / enemy=冲对面去 / none=字段缺失
+        self.robot_target = robot_target
         self.round_no = 0
         self.gold = 75                # 任务书 4.5.3：初始 75 金，刚好够 3 座火箭
         self.score = 0
@@ -254,12 +257,7 @@ class World:
                 {"id": 20013, "pos": {"x": self.enemy_station.x, "y": self.enemy_station.y},
                  "roleType": "station", "health": 1500, "level": 1},
             ]},
-            "robot": {"roles": [
-                {"id": r["id"], "pos": {"x": r["pos"].x, "y": r["pos"].y},
-                 "roleType": r["kind"], "health": r["health"],
-                 "abnormalState": "", "targetTeam": self.team_type}
-                for r in self.robots.values()
-            ]},
+            "robot": {"roles": [self._robot_payload(r) for r in self.robots.values()]},
             "phaseTask": self.phase_task,
             # 上一回合各角色动作是否合法：由 apply() 逐条写回
             "lastRoundRoleActionResults": {
@@ -284,6 +282,18 @@ class World:
     def band(self, pos: Pos) -> int:
         """该格到基地 2x2 外形的距离：1 = 武器区，2 = 城墙区。"""
         return min(cheb(pos, cell) for cell in self.footprint)
+
+    def _robot_payload(self, robot: dict) -> dict:
+        """按 robot_target 决定 targetTeam 怎么下发（省缺该字段时完全不带）。"""
+        row = {"id": robot["id"], "pos": {"x": robot["pos"].x, "y": robot["pos"].y},
+               "roleType": robot["kind"], "health": robot["health"],
+               "abnormalState": ""}
+        if self.robot_target == "ours":
+            row["targetTeam"] = self.team_type
+        elif self.robot_target == "enemy":
+            row["targetTeam"] = ("defender" if self.team_type == "challenger"
+                                 else "challenger")
+        return row
 
     def occupied(self) -> set[Pos]:
         """当前被占用的格子：中立元素 + 我方单位 + 机器人。"""
@@ -605,7 +615,8 @@ def check_goals(world: "World") -> tuple[int, int, list[str]]:
 def run(prices: dict, seed: int = 7, expect_boss: bool = True,
         min_gold: int = 0, llm_mode: str = "answer",
         task_gold: int = 80, faults: dict | None = None,
-        min_submitted: int = 2, mirror: bool = False) -> list[str]:
+        min_submitted: int = 2, mirror: bool = False,
+        robot_target: str = "ours", expect_fire: bool = True) -> list[str]:
     """跑完第一天 130 回合，返回失败原因列表（空表示全部通过）。
 
     参数都是为了让同一个函数能跑不同场景：矿价、任务奖励、LLM 行为、回包故障等。
@@ -613,7 +624,8 @@ def run(prices: dict, seed: int = 7, expect_boss: bool = True,
     # 策略的记忆是模块级单例，跑新场景前必须清空，否则会带着上一局的进度。
     memory_module.MEMORY.__init__()
     world = World(seed=seed, vendor_prices=prices, llm_mode=llm_mode,
-                  task_gold=task_gold, faults=faults, mirror=mirror)
+                  task_gold=task_gold, faults=faults, mirror=mirror,
+                  robot_target=robot_target)
     trace = []
     for round_no in range(1, 131):
         world.round_no = round_no
@@ -668,10 +680,13 @@ def run(prices: dict, seed: int = 7, expect_boss: bool = True,
     # 回归点：曾经因为「等 llmResp / 等 phaseTask 没有超时」导致开拓者整局零指令。
     if memory_module.MEMORY.task.phase == "solve":
         failures.append("开拓者整局卡死在任务求解阶段（等不到回包且没有超时保护）")
-    if events["attacks"] == 0:
-        failures.append("夜晚一次都没开火")
-    if events["damage"] == 0:
-        failures.append("夜晚开火但没打出任何伤害")
+    if expect_fire:
+        if events["attacks"] == 0:
+            failures.append("夜晚一次都没开火")
+        if events["damage"] == 0:
+            failures.append("夜晚开火但没打出任何伤害")
+    elif events["attacks"]:
+        failures.append(f"不该开火却开了 {events['attacks']} 次")
     if events["bad_shots"]:
         failures.append(f"有 {events['bad_shots']} 次射击超出武器射程")
     if world.gold < min_gold:
@@ -715,6 +730,14 @@ def main() -> int:
         # roles 不带 health：绝不能把缺失当成阵亡，否则全员都不被调度。
         ("roles 缺 health 字段", {"stone": 1, "iron": 3, "copper": 25},
          {"expect_boss": True, "faults": {"no_health": True}}),
+        # 只打「冲我们来的」：机器人 targetTeam 指向对面 -> 一炮不发
+        ("机器人目标是对面阵营",
+         {"stone": 1, "iron": 3, "copper": 25},
+         {"expect_boss": True, "robot_target": "enemy", "expect_fire": False}),
+        # 报文没给 targetTeam -> 无法区分，按全部视为威胁，照打
+        ("报文无 targetTeam",
+         {"stone": 1, "iron": 3, "copper": 25},
+         {"expect_boss": True, "robot_target": "none"}),
         # 镜像世界：验证「右下角那一方」的布局是左下角布局的中心对称。
         ("镜像基地(右下角)", {"stone": 1, "iron": 3, "copper": 25},
          {"expect_boss": True, "mirror": True}),

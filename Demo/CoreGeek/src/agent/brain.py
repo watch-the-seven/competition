@@ -78,8 +78,9 @@ LLM_WAIT_LIMIT = 3         # 发出 prompt 后最多等几回合 llmResp
 ACCEPT_WAIT_LIMIT = 3      # 发出 acceptTask 后最多等几回合任务原文
 TASK_STALL_LIMIT = 5       # 任何阶段连续几回合毫无进展就放弃该任务点
 TASK_WAIT_ROUNDS = 10      # 任务点迟迟不下发时，最多等几个回合再放开拓者去干别的
-FIRE_MIN_VALUE = 40.0      # 一轮齐射至少打出「2 个机器人份」的伤害才开火
-URGENT_BASE_DISTANCE = 9   # 敌人已经逼近基地到这个距离就无条件开火
+# 攻击口径（需求）：射程内只要有「冲我们来的」敌人就开火，不再攒齐射。
+#   威胁 = targetTeam 指向我方阵营的机器人（报文没给这个字段时无法区分，按全部处理）。
+# 因此不再需要「最低齐射伤害」这类保守阈值。
 
 
 # --------------------------------------------------------------------- 入口
@@ -1035,7 +1036,8 @@ def _night(turn: Turn, response: dict[str, Any]) -> None:
     if not rockets:
         return                              # 一座武器都没有，只能挨打
     characters = list(turn.controllable())
-    priority = _priority_robot(turn)        # 本回合最该打的那台机器人
+    threats = _threats(turn)                # 只打「冲我们来的」敌人
+    priority = _priority_robot(turn, threats)   # 其中离我方基地最近的那台
     # 虚拟血量池：多个火箭打同一批敌人时，用来扣减已分配伤害、避免重复计算溢出。
     virtual_hp = {robot.robot_id: robot.health for robot in turn.robots if robot.health > 0}
 
@@ -1086,9 +1088,11 @@ def _night(turn: Turn, response: dict[str, Any]) -> None:
     for role, tower in pairs:
         if distance(role.pos, tower.pos) > 1 or tower.cooldown > 0:
             continue                         # 够不着或还在冷却
-        cell, value = _best_blast(turn, tower, virtual_hp, priority)
-        if cell is None or not _should_fire(turn, cell, value, priority):
-            continue                         # 没有值得打的落点，留着冷却
+        # 「只要能打到就进攻」：射程内有目标就打，不再等齐射。
+        # cell 为 None 只有一种可能——射程内没有可打的威胁。
+        cell, _value = _best_blast(turn, tower, virtual_hp, priority, threats)
+        if cell is None:
+            continue
         commands[tower.unit_id] = attack_command(role.unit_id, cell)
         fired.add(role.unit_id)
         _apply_blast(turn, cell, virtual_hp)  # 把这发伤害记进虚拟血量池
@@ -1109,22 +1113,31 @@ def _night(turn: Turn, response: dict[str, Any]) -> None:
         _advance(turn, role, goals, claimed, commands)
 
 
-def _priority_robot(turn: Turn) -> Any:
-    """本回合的头号目标：离我方基地最近的那台机器人。
+def _threats(turn: Turn) -> list[Any]:
+    """「冲我们来的」敌人，也就是可以被攻击的目标集合。
 
-    需求口径明确是「离我们基地最近」，而不是「离敌方基地最近」。
-    若报文给了 targetTeam，则同距离下优先打「正在打我们」的那台。
+    接口文档 1.5.1：机器人有 targetTeam，取值为它要攻击的阵营。
+    所以 targetTeam == 我方阵营的，才是朝我们来的。
+
+    报文若通篇没有 targetTeam（样例 request.txt 就是这样），就无法区分敌我走向，
+    此时把全部机器人当作威胁——宁可多打，也不能漏防。
+    但如果字段存在、且没有任何一台指向我方，就说明这波不是冲我们来的，不打。
     """
-    robots = [robot for robot in turn.robots if robot.health > 0]
-    if not robots:
+    alive = [robot for robot in turn.robots if robot.health > 0]
+    tagged = [robot for robot in alive if robot.target_team]
+    if not tagged:
+        return alive
+    return [robot for robot in tagged if robot.target_team == turn.our_type]
+
+
+def _priority_robot(turn: Turn, threats: list[Any]) -> Any:
+    """头号目标：离我方基地最近的那台（需求口径，不是离敌方基地最近）。"""
+    if not threats:
         return None
-
-    def key(robot: Any) -> tuple[int, int, int]:
-        # 未提供 targetTeam 时按「威胁我方」处理，避免把目标误判成友军。
-        threat = 0 if (not robot.target_team or robot.target_team == turn.our_type) else 1
-        return (turn.distance_to_base(robot.pos), threat, robot.robot_id)
-
-    return min(robots, key=key)
+    return min(
+        threats,
+        key=lambda robot: (turn.distance_to_base(robot.pos), robot.robot_id),
+    )
 
 
 def _best_blast(
@@ -1132,17 +1145,17 @@ def _best_blast(
     tower: Unit,
     virtual_hp: dict[int, int],
     priority: Any,
+    threats: list[Any],
 ) -> tuple[Pos | None, float]:
     """在射程内枚举落点，返回单发期望伤害最大的坐标。
 
-    候选落点 = 每台机器人的位置 + 它们周围 8 格，
-    因为「打中心」和「打溅射边缘」是两种不同的覆盖方式，都要试。
+    只考虑「冲我们来的」（threats）、射程内、且虚拟血量还没被打空的机器人。
+    候选落点 = 每台目标的位置 + 它们周围 8 格：打中心与打溅射边缘是两种覆盖方式。
     """
     reach = tower.range_of_attack()
-    # 只考虑射程内、且虚拟血量还没被打空的机器人。
     robots = [
         robot
-        for robot in turn.robots
+        for robot in threats
         if virtual_hp.get(robot.robot_id, 0) > 0
         and distance(tower.pos, robot.pos) <= reach
     ]
@@ -1205,18 +1218,3 @@ def _apply_blast(turn: Turn, cell: Pos, virtual_hp: dict[int, int]) -> None:
             continue
         if robot.robot_id in virtual_hp:
             virtual_hp[robot.robot_id] = max(0, virtual_hp[robot.robot_id] - damage)
-
-
-def _should_fire(turn: Turn, cell: Pos, value: float, priority: Any) -> bool:
-    """该不该开这一炮。
-
-    火箭有 3 回合冷却，打一只远处的散兵很亏（占了冷却却只换 20 伤害），
-    所以要满足其一才开火：一轮能打出 2 个机器人份的伤害，或敌人已经逼近基地。
-    """
-    if value <= 0:
-        return False
-    if value >= FIRE_MIN_VALUE:
-        return True
-    if priority is not None and turn.distance_to_base(priority.pos) <= URGENT_BASE_DISTANCE:
-        return True
-    return turn.distance_to_base(cell) <= URGENT_BASE_DISTANCE
